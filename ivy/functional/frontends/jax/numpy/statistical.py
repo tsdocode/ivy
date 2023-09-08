@@ -1,12 +1,70 @@
 # local
 
 import ivy
+import operator
 from ivy.func_wrapper import with_unsupported_dtypes
 from ivy.functional.frontends.jax.func_wrapper import (
     to_ivy_arrays_and_back,
     handle_jax_dtype,
 )
 from ivy.functional.frontends.jax.numpy import promote_types_of_jax_inputs
+
+
+# --- Helpers --- #
+# --------------- #
+
+
+# return ivy.sum(indices * strides, axis=1)
+
+
+def _get_outer_edges(a, range):
+    """Determine the outer bin edges to use, from either the data or the range
+    argument."""
+    if range is not None:
+        first_edge, last_edge = range
+        if first_edge > last_edge:
+            raise ValueError("max must be larger than min in range parameter.")
+        if not (ivy.isfinite(first_edge) and ivy.isfinite(last_edge)):
+            raise ValueError(
+                "supplied range of [{}, {}] is not finite".format(first_edge, last_edge)
+            )
+    elif a.size == 0:
+        # handle empty arrays. Can't determine range, so use 0-1.
+        first_edge, last_edge = 0, 1
+    else:
+        first_edge, last_edge = a.min(), a.max()
+        if not (ivy.isfinite(first_edge) and ivy.isfinite(last_edge)):
+            raise ValueError(
+                "autodetected range of [{}, {}] is not finite".format(
+                    first_edge, last_edge
+                )
+            )
+
+    if first_edge - last_edge == 0:
+        first_edge -= 0.5
+        last_edge += 0.5
+
+    return first_edge, last_edge
+
+
+def _ravel_multi_index(multi_index, dims):
+    ivy.array(multi_index).T
+    dims = ivy.array(dims[::-1])  # reverse dims for 'C' style
+    strides = ivy.concat((ivy.array([1]), ivy.cumprod(dims, axis=0)[:-1]))[
+        ::-1
+    ]  # calculate strides and reverse back
+
+    result = ivy.array(0, dtype=(multi_index[0].dtype if multi_index else ivy.int32))
+
+    for i, s in zip(multi_index, strides):
+        result = result + i * int(s)
+        print("IVY:result:", result)
+
+    return result
+
+
+# --- Main --- #
+# ------------ #
 
 
 @to_ivy_arrays_and_back
@@ -173,6 +231,148 @@ def einsum(
     _dot_general=None,
 ):
     return ivy.einsum(subscripts, *operands, out=out)
+
+
+@to_ivy_arrays_and_back
+def histogramdd(sample, bins=10, range=None, weights=None, density=None):
+    import builtins
+
+    _range = builtins.range
+
+    try:
+        # Sample is an ND-array.
+        N, D = sample.shape
+    except (AttributeError, ValueError):
+        # Sample is a sequence of 1D arrays.
+        sample = ivy.atleast_2d(sample).T
+        N, D = sample.shape
+
+    nbin = ivy.empty(D, dtype=ivy.int64)
+    edges = D * [None]
+    dedges = D * [None]
+    if weights is not None:
+        weights = ivy.asarray(weights)
+
+    print("np:range", range)
+
+    try:
+        M = len(bins)
+        if M != D:
+            raise ValueError(
+                "The dimension of bins must be equal to the dimension of the sample x."
+            )
+    except TypeError:
+        # bins is an integer
+        bins = D * [bins]
+
+    # normalize the range argument
+    if range is None:
+        range = (None,) * D
+    elif len(range) != D:
+        raise ValueError("range argument must have one entry per dimension")
+
+    # Create edge arrays
+    for i in _range(D):
+        if ivy.get_num_dims(bins[i]) == 0:
+            if bins[i] < 1:
+                raise ValueError(
+                    "`bins[{}]` must be positive, when an integer".format(i)
+                )
+            smin, smax = _get_outer_edges(sample[:, i], range[i])
+            try:
+                n = operator.index(bins[i])
+
+            except TypeError as e:
+                raise TypeError(
+                    "`bins[{}]` must be an integer, when a scalar".format(i)
+                ) from e
+
+            edges[i] = ivy.linspace(smin, smax, n + 1, dtype=sample.dtype)
+            print("LINSPACE:", sample.dtype, smin, smax, edges[i])
+
+        elif ivy.get_num_dims(bins[i]) == 1:
+            edges[i] = ivy.asarray(bins[i])
+            if ivy.any(edges[i][:-1] > edges[i][1:]):
+                raise ValueError(
+                    "`bins[{}]` must be monotonically increasing, when an array".format(
+                        i
+                    )
+                )
+        else:
+            raise ValueError("`bins[{}]` must be a scalar or 1d array".format(i))
+
+        nbin[i] = len(edges[i]) + 1  # includes an outlier on each end
+        dedges[i] = ivy.diff(edges[i])
+
+    print("ivy:edges:", edges)
+    print("ivy:edges_dtype:", edges[0].dtype)
+
+    # Compute the bin number each sample falls into.
+    Ncount = tuple(
+        # avoid np.digitize to work around gh-11022
+        ivy.searchsorted(edges[i], sample[:, i], side="right")
+        for i in _range(D)
+    )
+
+    # Using digitize, values that fall on an edge are put in the right bin.
+    # For the rightmost bin, we want values equal to the right edge to be
+    # counted in the last bin, and not as an outlier.
+    for i in _range(D):
+        # Find which points are on the rightmost edge.
+        on_edge = ivy.equal(sample[:, i], edges[i][-1])
+        # Shift these points one bin to the left.
+        Ncount[i][on_edge] -= 1
+
+    print("IVY:ncount", Ncount)
+
+    # Compute the sample indices in the flattened histogram matrix.
+    # This raises an error if the array is too large.
+    xy = _ravel_multi_index(Ncount, nbin)
+
+    print("IVY:nbin", nbin)
+    print("IVY:XY", xy)
+    # Compute the number of repetitions in xy and assign it to the
+    # flattened histmat.
+    nbin_prod = nbin.prod().astype("int32")
+    hist = ivy.bincount(xy, weights=weights, minlength=nbin_prod)
+
+    print("IVY:bincount", hist)
+
+    # Shape into a proper matrix
+    hist = hist.reshape(nbin)
+
+    print("IVY:reshape", hist.shape)
+
+    # This preserves the (bad) behavior observed in gh-7845, for now.
+    hist = hist.astype(sample.dtype)
+
+    print("IVY:cast", hist.shape)
+
+    # Remove outliers (indices 0 and -1 for each dimension).
+    core = D * (slice(1, -1),)
+    hist = hist[core]
+
+    print("IVY:slice", hist)
+
+    if density:
+        # calculate the probability density function
+        s = hist.sum()
+        print("IVY:SUM:", s)
+        for i in _range(D):
+            shape = ivy.ones(D, dtype="int32")
+            shape[i] = nbin[i] - 2
+            hist = hist / dedges[i].reshape(shape)
+        hist /= s
+
+    print("\n\n")
+
+    print("NBIN", ivy.Shape(nbin - 2))
+    print("hist shape", hist.shape)
+
+    if hist.shape != ivy.Shape(nbin - 2):
+        raise RuntimeError("Internal Shape Error")
+
+    return hist, *edges
 
 
 @to_ivy_arrays_and_back

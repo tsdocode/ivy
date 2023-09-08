@@ -13,6 +13,7 @@ from ivy_tests.test_ivy.test_functional.test_core.test_statistical import (
     _statistical_dtype_values,
     _get_castable_dtype,
 )
+
 from ivy import inf
 
 
@@ -192,8 +193,126 @@ def _get_dtype_value1_value2_cov(
     return [dtype], value1, value2, rowVar, bias, ddof, fweights, aweights
 
 
+@st.composite
+def _histogramdd_helper(draw):
+    available_dtypes = draw(helpers.get_dtypes("float"))
+    unsupport_dtypes = ["bfloat16", "float16"]
+
+    available_dtypes = [
+        dtype for dtype in available_dtypes if dtype not in unsupport_dtypes
+    ]
+
+    # available_dtypes.remove("bfloat16")
+    dtype_input = draw(st.sampled_from(available_dtypes))
+
+    # Generate sample data
+    shape = draw(
+        helpers.get_shape(
+            min_num_dims=2, max_num_dims=2, min_dim_size=2, max_dim_size=5
+        )
+    )
+
+    print(shape)
+
+    n_dim, m_dim = shape
+
+    # Generate bin specifications using your helper
+    bins = draw(
+        st.one_of(
+            helpers.lists(
+                x=st.integers(min_value=1, max_value=10),
+                size_bounds=(m_dim, m_dim),
+            ),
+            st.integers(min_value=1, max_value=100),
+        )
+    )
+
+    ranges = None
+
+    # for _ in range(shape[0]):
+    #     range_value = (
+    #         draw(helpers.array_values(
+    #             dtype=dtype_input,
+    #             shape=2
+    #         ))
+    #     )
+    #     ranges.append(
+    #         range_value
+    #     )
+
+    # Generate other optional arguments (density, weights)
+    density = draw(st.booleans())
+
+    # Generate weights using your helper if density is True
+    weights = (
+        draw(
+            helpers.array_values(
+                dtype=dtype_input,
+                shape=n_dim,
+                min_value=-20,
+                max_value=20,
+            )
+        )
+        if density
+        else st.none()
+    )
+
+    # Use your helpers.array_values to generate sample data for density=False
+    if not density:
+        weights = draw(
+            helpers.array_values(
+                dtype=dtype_input,
+                shape=n_dim,
+                min_value=-20,
+                max_value=20,
+            )
+        )
+
+    sample_data = draw(
+        helpers.array_values(
+            dtype=dtype_input,
+            shape=shape,
+            min_value=10,
+            max_value=20,
+            abs_smallest_val=0.5,
+        )  # You can customize the dtype as needed
+    )
+
+    print("Generate test done")
+
+    return sample_data, bins, ranges, density, weights, dtype_input
+
+
 # --- Main --- #
 # ------------ #
+
+
+@handle_frontend_test(fn_tree="jax.numpy.histogramdd", values=_histogramdd_helper())
+def test_histogramdd(
+    *,
+    values,
+    on_device,
+    fn_tree,
+    frontend,
+    test_flags,
+    backend_fw,
+):
+    (sample_data, bins, ranges, density, weights, dtype_input) = values
+    helpers.test_frontend_function(
+        sample=sample_data,
+        bins=bins,
+        range=ranges,
+        weights=weights,
+        density=density,
+        input_dtypes=[dtype_input],
+        fn_tree=fn_tree,
+        backend_to_test=backend_fw,
+        frontend=frontend,
+        test_flags=test_flags,
+        on_device=on_device,
+        atol=1e-03,
+        rtol=1e-03,
+    )
 
 
 # argmin
